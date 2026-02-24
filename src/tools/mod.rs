@@ -55,6 +55,7 @@ pub mod screenshot;
 pub mod shell;
 pub mod task_plan;
 pub mod traits;
+pub mod url_validation;
 pub mod web_fetch;
 pub mod web_search_tool;
 
