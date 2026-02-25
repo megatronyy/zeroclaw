@@ -129,6 +129,10 @@ pub struct Config {
     #[serde(default)]
     pub runtime: RuntimeConfig,
 
+    /// Research phase configuration (`[research]`). Proactive information gathering.
+    #[serde(default)]
+    pub research: ResearchPhaseConfig,
+
     /// Reliability settings: retries, fallback providers, backoff (`[reliability]`).
     #[serde(default)]
     pub reliability: ReliabilityConfig,
@@ -248,6 +252,13 @@ pub struct Config {
     /// Inter-process agent communication (`[agents_ipc]`).
     #[serde(default)]
     pub agents_ipc: AgentsIpcConfig,
+
+    /// Vision support override for the active provider/model.
+    /// - `None` (default): use provider's built-in default
+    /// - `Some(true)`: force vision support on (e.g. Ollama running llava)
+    /// - `Some(false)`: force vision support off
+    #[serde(default)]
+    pub model_support_vision: Option<bool>,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -435,7 +446,7 @@ fn default_agents_ipc_staleness_secs() -> u64 {
 
 /// Inter-process agent communication configuration (`[agents_ipc]` section).
 ///
-/// When enabled, registers 5 IPC tools that let independent ZeroClaw processes
+/// When enabled, registers IPC tools that let independent ZeroClaw processes
 /// on the same host discover each other and exchange messages via a shared
 /// SQLite database. Disabled by default (zero overhead when off).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1151,6 +1162,15 @@ pub struct WebFetchConfig {
     /// Enable `web_fetch` tool for fetching web page content
     #[serde(default)]
     pub enabled: bool,
+    /// Provider: "fast_html2md", "nanohtml2text", or "firecrawl"
+    #[serde(default = "default_web_fetch_provider")]
+    pub provider: String,
+    /// Optional provider API key (required for provider = "firecrawl")
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Optional provider API URL override (for self-hosted providers)
+    #[serde(default)]
+    pub api_url: Option<String>,
     /// Allowed domains for web fetch (exact or subdomain match; `["*"]` = all public hosts)
     #[serde(default)]
     pub allowed_domains: Vec<String>,
@@ -1169,6 +1189,10 @@ fn default_web_fetch_max_response_size() -> usize {
     500_000 // 500KB
 }
 
+fn default_web_fetch_provider() -> String {
+    "fast_html2md".into()
+}
+
 fn default_web_fetch_timeout_secs() -> u64 {
     30
 }
@@ -1177,6 +1201,9 @@ impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: default_web_fetch_provider(),
+            api_key: None,
+            api_url: None,
             allowed_domains: vec!["*".into()],
             blocked_domains: vec![],
             max_response_size: default_web_fetch_max_response_size(),
@@ -1196,6 +1223,12 @@ pub struct WebSearchConfig {
     /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
+    /// Generic provider API key (used by firecrawl and as fallback for brave)
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Optional provider API URL override (for self-hosted providers)
+    #[serde(default)]
+    pub api_url: Option<String>,
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
@@ -1224,6 +1257,8 @@ impl Default for WebSearchConfig {
         Self {
             enabled: false,
             provider: default_web_search_provider(),
+            api_key: None,
+            api_url: None,
             brave_api_key: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -2277,6 +2312,109 @@ impl Default for RuntimeConfig {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
             reasoning_enabled: None,
+        }
+    }
+}
+
+// ── Research Phase ───────────────────────────────────────────────
+
+/// Research phase trigger mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ResearchTrigger {
+    /// Never trigger research phase.
+    #[default]
+    Never,
+    /// Always trigger research phase before responding.
+    Always,
+    /// Trigger when message contains configured keywords.
+    Keywords,
+    /// Trigger when message exceeds minimum length.
+    Length,
+    /// Trigger when message contains a question mark.
+    Question,
+}
+
+/// Research phase configuration (`[research]` section).
+///
+/// When enabled, the agent proactively gathers information using tools
+/// before generating its main response. This creates a "thinking" phase
+/// where the agent explores the codebase, searches memory, or fetches
+/// external data to inform its answer.
+///
+/// ```toml
+/// [research]
+/// enabled = true
+/// trigger = "keywords"
+/// keywords = ["find", "search", "check", "investigate"]
+/// max_iterations = 5
+/// show_progress = true
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResearchPhaseConfig {
+    /// Enable the research phase.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// When to trigger research phase.
+    #[serde(default)]
+    pub trigger: ResearchTrigger,
+
+    /// Keywords that trigger research phase (when `trigger = "keywords"`).
+    #[serde(default = "default_research_keywords")]
+    pub keywords: Vec<String>,
+
+    /// Minimum message length to trigger research (when `trigger = "length"`).
+    #[serde(default = "default_research_min_length")]
+    pub min_message_length: usize,
+
+    /// Maximum tool call iterations during research phase.
+    #[serde(default = "default_research_max_iterations")]
+    pub max_iterations: usize,
+
+    /// Show detailed progress during research (tool calls, results).
+    #[serde(default = "default_true")]
+    pub show_progress: bool,
+
+    /// Custom system prompt prefix for research phase.
+    /// If empty, uses default research instructions.
+    #[serde(default)]
+    pub system_prompt_prefix: String,
+}
+
+fn default_research_keywords() -> Vec<String> {
+    vec![
+        "find".into(),
+        "search".into(),
+        "check".into(),
+        "investigate".into(),
+        "look".into(),
+        "research".into(),
+        "найди".into(),
+        "проверь".into(),
+        "исследуй".into(),
+        "поищи".into(),
+    ]
+}
+
+fn default_research_min_length() -> usize {
+    50
+}
+
+fn default_research_max_iterations() -> usize {
+    5
+}
+
+impl Default for ResearchPhaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger: ResearchTrigger::default(),
+            keywords: default_research_keywords(),
+            min_message_length: default_research_min_length(),
+            max_iterations: default_research_max_iterations(),
+            show_progress: true,
+            system_prompt_prefix: String::new(),
         }
     }
 }
@@ -3726,6 +3864,7 @@ impl Default for Config {
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
+            research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
@@ -3756,6 +3895,7 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            model_support_vision: None,
         }
     }
 }
@@ -4676,6 +4816,18 @@ impl Config {
             }
         }
 
+        // Vision support override: ZEROCLAW_MODEL_SUPPORT_VISION or MODEL_SUPPORT_VISION
+        if let Ok(flag) = std::env::var("ZEROCLAW_MODEL_SUPPORT_VISION")
+            .or_else(|_| std::env::var("MODEL_SUPPORT_VISION"))
+        {
+            let normalized = flag.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => self.model_support_vision = Some(true),
+                "0" | "false" | "no" | "off" => self.model_support_vision = Some(false),
+                _ => {}
+            }
+        }
+
         // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
         if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
@@ -5238,6 +5390,7 @@ default_temperature = 0.7
                 kind: "docker".into(),
                 ..RuntimeConfig::default()
             },
+            research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
@@ -5304,6 +5457,7 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            model_support_vision: None,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -5396,6 +5550,24 @@ reasoning_enabled = false
     }
 
     #[test]
+    async fn model_support_vision_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+model_support_vision = true
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.model_support_vision, Some(true));
+
+        // Default (omitted) should be None
+        let raw_no_vision = r#"
+default_temperature = 0.7
+"#;
+        let parsed2: Config = toml::from_str(raw_no_vision).unwrap();
+        assert_eq!(parsed2.model_support_vision, None);
+    }
+
+    #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
@@ -5458,6 +5630,7 @@ tool_dispatcher = "xml"
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
+            research: ResearchPhaseConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
@@ -5488,6 +5661,7 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            model_support_vision: None,
         };
 
         config.save().await.unwrap();
@@ -7258,6 +7432,28 @@ default_model = "legacy-model"
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
         std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+    }
+
+    #[test]
+    async fn env_override_model_support_vision() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert_eq!(config.model_support_vision, None);
+
+        std::env::set_var("ZEROCLAW_MODEL_SUPPORT_VISION", "true");
+        config.apply_env_overrides();
+        assert_eq!(config.model_support_vision, Some(true));
+
+        std::env::set_var("ZEROCLAW_MODEL_SUPPORT_VISION", "false");
+        config.apply_env_overrides();
+        assert_eq!(config.model_support_vision, Some(false));
+
+        std::env::set_var("ZEROCLAW_MODEL_SUPPORT_VISION", "maybe");
+        config.model_support_vision = Some(true);
+        config.apply_env_overrides();
+        assert_eq!(config.model_support_vision, Some(true));
+
+        std::env::remove_var("ZEROCLAW_MODEL_SUPPORT_VISION");
     }
 
     #[test]
